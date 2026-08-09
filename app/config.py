@@ -9,7 +9,8 @@ def f(name, default): return float(os.getenv(name, default))
 
 @dataclass(frozen=True)
 class Settings:
-    deriv_ws_url:str=os.getenv('DERIV_WS_URL','wss://api.derivws.com/trading/v1/options/ws/public')
+    deriv_ws_url:str=os.getenv('DERIV_WS_URL','wss://ws.derivws.com/websockets/v3')
+    deriv_app_id:str=os.getenv('DERIV_APP_ID','1089')
     telegram_bot_token:str=os.getenv('TELEGRAM_BOT_TOKEN','')
     telegram_chat_id:str=os.getenv('TELEGRAM_CHAT_ID','')
     poll_seconds:int=i('POLL_SECONDS',60)
