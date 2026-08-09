@@ -45,7 +45,7 @@ class DerivPublicClient:
         #   renvoyer une liste vide pour cette région par défaut.
         # 'svg' (Deriv (SVG) LLC) couvre le plus large éventail de
         # symboles, y compris forex, indices et synthétiques.
-        d=await self._request({'active_symbols':'full','product_type':'basic','landing_company':'svg'})
+        d=await self._request({'active_symbols':'brief','landing_company':'svg'})
         result=d.get('active_symbols',[])
         if not result:
             log.info('Deriv active_symbols raw response keys=%s echo=%s',list(d.keys()),d.get('echo_req'))
