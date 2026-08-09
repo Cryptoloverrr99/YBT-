@@ -1,9 +1,11 @@
-import asyncio,json
+import asyncio,json,logging
 from typing import Any
 from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
 import websockets
 from .models import Candle
 from .config import settings
+
+log=logging.getLogger(__name__)
 
 def _with_app_id(url: str, app_id: str) -> str:
     """Ajoute ?app_id=... à l'URL si absent.
@@ -35,10 +37,19 @@ class DerivPublicClient:
                     if 'error' in d: raise RuntimeError(d['error'].get('message','Deriv API error'))
                     return d
     async def active_symbols(self):
-        # `product_type` doit être fourni explicitement : sans lui,
-        # Deriv renvoie désormais une liste vide plutôt qu'une erreur.
-        d=await self._request({'active_symbols':'full','product_type':'basic'})
-        return d.get('active_symbols',[])
+        # `product_type` et `landing_company` doivent être fournis
+        # explicitement :
+        # - sans product_type, Deriv renvoie une liste vide
+        # - sans landing_company, Deriv déduit la région depuis l'IP
+        #   du serveur (ex: datacenter Render aux US) et peut aussi
+        #   renvoyer une liste vide pour cette région par défaut.
+        # 'svg' (Deriv (SVG) LLC) couvre le plus large éventail de
+        # symboles, y compris forex, indices et synthétiques.
+        d=await self._request({'active_symbols':'full','product_type':'basic','landing_company':'svg'})
+        result=d.get('active_symbols',[])
+        if not result:
+            log.info('Deriv active_symbols raw response keys=%s echo=%s',list(d.keys()),d.get('echo_req'))
+        return result
     async def candles(self,symbol,granularity,count):
         d=await self._request({'ticks_history':symbol,'end':'latest','count':count,'granularity':granularity,'style':'candles','subscribe':0})
         raw=d.get('candles',[])
