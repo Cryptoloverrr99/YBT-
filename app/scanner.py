@@ -32,6 +32,9 @@ class MultiTFScanner:
     async def run_once(self):
         syms=await self.client.active_symbols()
         selected=[s for s in syms if str(s.get('market','')).lower() in ALLOWED and not int(s.get('is_trading_suspended',0) or 0)]
+        if not selected and syms:
+            sample=sorted({str(s.get('market','')) for s in syms})[:10]
+            log.info('0 symbols after filter; %d symbols returned by Deriv, sample markets=%s',len(syms),sample)
         log.info('Scanning %d symbols sequentially',len(selected))
         for meta in selected:
             try: await self.scan_symbol(meta)

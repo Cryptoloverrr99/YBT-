@@ -35,7 +35,10 @@ class DerivPublicClient:
                     if 'error' in d: raise RuntimeError(d['error'].get('message','Deriv API error'))
                     return d
     async def active_symbols(self):
-        d=await self._request({'active_symbols':'full'}); return d.get('active_symbols',[])
+        # `product_type` doit être fourni explicitement : sans lui,
+        # Deriv renvoie désormais une liste vide plutôt qu'une erreur.
+        d=await self._request({'active_symbols':'full','product_type':'basic'})
+        return d.get('active_symbols',[])
     async def candles(self,symbol,granularity,count):
         d=await self._request({'ticks_history':symbol,'end':'latest','count':count,'granularity':granularity,'style':'candles','subscribe':0})
         raw=d.get('candles',[])
