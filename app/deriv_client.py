@@ -8,16 +8,27 @@ import websockets
 
 class DerivPublicClient:
     """
-    Client public Deriv pour :
-    - récupérer les symboles actifs
-    - récupérer les bougies historiques
-    - réutiliser UNE connexion WebSocket
-    - éviter les erreurs HTTP 429
-    - convertir automatiquement H1/H2/H3/H4 en secondes
+    Client public Deriv.
+
+    Fonctions :
+    - récupération des symboles actifs
+    - récupération des bougies historiques
+    - connexion WebSocket persistante
+    - limitation des reconnexions
+    - gestion des erreurs 429 / connexions fermées
+    - conversion automatique des timeframes en secondes
+    - aucune authentification nécessaire pour les données publiques
     """
 
-    DEFAULT_WS_BASE = "wss://ws.derivws.com/websockets/v3"
+    # Endpoint PUBLIC Deriv.
+    #
+    # IMPORTANT :
+    # Nous n'ajoutons PAS app_id à cette URL.
+    # active_symbols et ticks_history sont des endpoints
+    # de données publiques.
+    DEFAULT_WS_URL = "wss://ws.binaryws.com/websockets/v3"
 
+    # Timeframes acceptés par l'application.
     TIMEFRAME_TO_SECONDS = {
         "1m": 60,
         "2m": 120,
@@ -26,14 +37,17 @@ class DerivPublicClient:
         "10m": 600,
         "15m": 900,
         "30m": 1800,
+
         "1h": 3600,
         "2h": 7200,
         "3h": 10800,
         "4h": 14400,
+        "6h": 21600,
         "8h": 28800,
+        "12h": 43200,
         "1d": 86400,
 
-        # variantes majuscules
+        # Majuscules
         "1M": 60,
         "2M": 120,
         "3M": 180,
@@ -41,104 +55,203 @@ class DerivPublicClient:
         "10M": 600,
         "15M": 900,
         "30M": 1800,
+
         "1H": 3600,
         "2H": 7200,
         "3H": 10800,
         "4H": 14400,
+        "6H": 21600,
         "8H": 28800,
+        "12H": 43200,
         "1D": 86400,
     }
 
-    def __init__(self) -> None:
-        self.app_id = os.getenv("DERIV_APP_ID", "").strip()
+    # Granularités valides utilisées par le scanner.
+    # Deriv attend une granularité en secondes.
+    VALID_GRANULARITIES = {
+        60,
+        120,
+        180,
+        300,
+        600,
+        900,
+        1800,
+        3600,
+        7200,
+        10800,
+        14400,
+        21600,
+        28800,
+        43200,
+        86400,
+    }
 
-        # Permet de conserver une URL personnalisée si elle existe.
+    def __init__(self) -> None:
+        """
+        Initialise le client.
+
+        DERIV_WS_URL peut éventuellement être utilisé pour
+        fournir une URL personnalisée.
+
+        Pour éviter les anciens problèmes de 401, l'URL par défaut
+        reste toujours l'endpoint public.
+        """
+
         configured_url = os.getenv("DERIV_WS_URL", "").strip()
 
         if configured_url:
             self.url = configured_url
         else:
-            if self.app_id:
-                self.url = f"{self.DEFAULT_WS_BASE}?app_id={self.app_id}"
-            else:
-                self.url = self.DEFAULT_WS_BASE
+            self.url = self.DEFAULT_WS_URL
 
         self.ws: Optional[Any] = None
+
+        # Empêche plusieurs connexions simultanées.
         self._connect_lock = asyncio.Lock()
+
+        # Empêche plusieurs requêtes simultanées sur la même
+        # connexion et donc les réponses mélangées.
         self._request_lock = asyncio.Lock()
+
         self._req_id = 0
 
-    # ------------------------------------------------------------------
-    # TIMEFRAME
-    # ------------------------------------------------------------------
+    # ================================================================
+    # TIMEFRAME / GRANULARITY
+    # ================================================================
 
     @classmethod
     def normalize_granularity(cls, timeframe: Any) -> int:
         """
-        Transforme :
-            1H -> 3600
-            2H -> 7200
-            3H -> 10800
-            4H -> 14400
+        Convertit un timeframe en secondes.
 
-        Accepte également directement une valeur entière en secondes.
+        Exemples :
+
+            "1m"  -> 60
+            "15m" -> 900
+            "1h"  -> 3600
+            "2h"  -> 7200
+            "3h"  -> 10800
+            "4h"  -> 14400
+
+        Accepte également directement :
+            3600
+            "3600"
         """
 
+        if timeframe is None:
+            raise ValueError("Granularity cannot be None")
+
         if isinstance(timeframe, bool):
-            raise ValueError("Invalid timeframe: boolean value")
+            raise ValueError(
+                "Invalid granularity: boolean value"
+            )
+
+        # ------------------------------------------------------------
+        # Entier
+        # ------------------------------------------------------------
 
         if isinstance(timeframe, int):
             seconds = timeframe
 
+        # ------------------------------------------------------------
+        # Float
+        # ------------------------------------------------------------
+
         elif isinstance(timeframe, float):
+
             if not timeframe.is_integer():
                 raise ValueError(
                     f"Invalid granularity: {timeframe}"
                 )
+
             seconds = int(timeframe)
 
+        # ------------------------------------------------------------
+        # Texte
+        # ------------------------------------------------------------
+
         else:
+
             value = str(timeframe).strip()
 
+            if not value:
+                raise ValueError(
+                    "Granularity cannot be empty"
+                )
+
+            # Correspondance directe.
             if value in cls.TIMEFRAME_TO_SECONDS:
                 seconds = cls.TIMEFRAME_TO_SECONDS[value]
+
             else:
+
+                # Correspondance insensible à la casse.
                 lower_value = value.lower()
 
                 if lower_value in cls.TIMEFRAME_TO_SECONDS:
-                    seconds = cls.TIMEFRAME_TO_SECONDS[lower_value]
+                    seconds = cls.TIMEFRAME_TO_SECONDS[
+                        lower_value
+                    ]
+
                 else:
-                    # Accepte "3600" sous forme de texte.
+
+                    # Exemple : "3600"
                     try:
                         seconds = int(value)
+
                     except ValueError as exc:
                         raise ValueError(
-                            f"Unsupported timeframe/granularity: {timeframe}"
+                            f"Unsupported timeframe/granularity: "
+                            f"{timeframe}"
                         ) from exc
+
+        # ------------------------------------------------------------
+        # Validation
+        # ------------------------------------------------------------
 
         if seconds <= 0:
             raise ValueError(
                 f"Granularity must be positive: {seconds}"
             )
 
+        # Deriv ne doit recevoir que les granularités supportées
+        # par notre scanner.
+        if seconds not in cls.VALID_GRANULARITIES:
+            raise ValueError(
+                f"Unsupported Deriv granularity: {seconds} seconds"
+            )
+
         return seconds
 
-    # ------------------------------------------------------------------
+    # ================================================================
     # CONNECTION
-    # ------------------------------------------------------------------
+    # ================================================================
 
     async def connect(self) -> None:
         """
-        Ouvre une seule connexion WebSocket et la conserve.
+        Ouvre une connexion WebSocket publique persistante.
+
+        Une seule connexion est utilisée par le client.
         """
 
         async with self._connect_lock:
+
+            # Connexion déjà active.
             if self.ws is not None:
+
                 try:
+
                     if not self.ws.closed:
                         return
+
                 except Exception:
                     pass
+
+            self.ws = None
+
+            # --------------------------------------------------------
+            # Connexion
+            # --------------------------------------------------------
 
             self.ws = await websockets.connect(
                 self.url,
@@ -146,6 +259,7 @@ class DerivPublicClient:
                 ping_timeout=20,
                 close_timeout=5,
                 max_size=8_000_000,
+                open_timeout=20,
             )
 
     async def close(self) -> None:
@@ -153,28 +267,34 @@ class DerivPublicClient:
         Ferme proprement la connexion.
         """
 
-        if self.ws is not None:
+        ws = self.ws
+        self.ws = None
+
+        if ws is not None:
+
             try:
-                await self.ws.close()
+                await ws.close()
+
             except Exception:
                 pass
-            finally:
-                self.ws = None
 
-    # ------------------------------------------------------------------
+    # ================================================================
     # REQUEST
-    # ------------------------------------------------------------------
+    # ================================================================
 
     async def _request(
         self,
         payload: Dict[str, Any],
-        retries: int = 3,
+        retries: int = 4,
     ) -> Dict[str, Any]:
         """
-        Envoie une requête sur la connexion persistante.
+        Envoie une requête à Deriv.
 
-        Une seule requête est traitée à la fois afin d'éviter que les
-        réponses WebSocket soient mélangées.
+        Une seule requête à la fois est autorisée afin de garantir
+        que les réponses correspondent bien au req_id envoyé.
+
+        En cas de coupure WebSocket :
+            connexion -> requête -> reconnexion -> retry
         """
 
         async with self._request_lock:
@@ -182,22 +302,44 @@ class DerivPublicClient:
             last_error: Optional[Exception] = None
 
             for attempt in range(retries):
+
                 try:
+
+                    # ------------------------------------------------
+                    # Connexion
+                    # ------------------------------------------------
+
                     await self.connect()
 
                     if self.ws is None:
                         raise RuntimeError(
-                            "Deriv WebSocket connection is unavailable"
+                            "Deriv WebSocket connection unavailable"
                         )
 
+                    # ------------------------------------------------
+                    # Request ID
+                    # ------------------------------------------------
+
                     self._req_id += 1
+                    request_id = self._req_id
 
                     request = dict(payload)
-                    request["req_id"] = self._req_id
+                    request["req_id"] = request_id
 
-                    await self.ws.send(json.dumps(request))
+                    # ------------------------------------------------
+                    # Envoi
+                    # ------------------------------------------------
+
+                    await self.ws.send(
+                        json.dumps(request)
+                    )
+
+                    # ------------------------------------------------
+                    # Réception
+                    # ------------------------------------------------
 
                     while True:
+
                         raw = await self.ws.recv()
 
                         if isinstance(raw, bytes):
@@ -205,34 +347,48 @@ class DerivPublicClient:
 
                         data = json.loads(raw)
 
-                        # On ignore les messages qui ne correspondent
-                        # pas à notre requête.
+                        # ------------------------------------------------
+                        # Ignore les messages d'un autre request.
+                        # ------------------------------------------------
+
                         response_req_id = data.get("req_id")
 
                         if (
                             response_req_id is not None
-                            and response_req_id != self._req_id
+                            and response_req_id != request_id
                         ):
                             continue
 
+                        # ------------------------------------------------
+                        # Erreur Deriv
+                        # ------------------------------------------------
+
                         if "error" in data:
-                            error = data["error"]
+
+                            error = data.get(
+                                "error",
+                                {},
+                            )
+
+                            code = error.get(
+                                "code",
+                                "DERIV_ERROR",
+                            )
 
                             message = error.get(
                                 "message",
                                 "Deriv API error",
                             )
 
-                            code = error.get("code", "")
-
-                            if code:
-                                raise RuntimeError(
-                                    f"{code}: {message}"
-                                )
-
-                            raise RuntimeError(message)
+                            raise RuntimeError(
+                                f"{code}: {message}"
+                            )
 
                         return data
+
+                # --------------------------------------------------------
+                # WebSocket fermé
+                # --------------------------------------------------------
 
                 except (
                     websockets.exceptions.ConnectionClosed,
@@ -246,37 +402,109 @@ class DerivPublicClient:
 
                     await self.close()
 
-                    # Petit délai avant reconnexion.
-                    await asyncio.sleep(
-                        min(2 ** attempt, 5)
+                    if attempt < retries - 1:
+
+                        # Backoff progressif :
+                        # 1s -> 2s -> 4s
+                        delay = min(
+                            2 ** attempt,
+                            5,
+                        )
+
+                        await asyncio.sleep(delay)
+
+                # --------------------------------------------------------
+                # Erreurs WebSocket HTTP (401 / 429 / etc.)
+                # --------------------------------------------------------
+
+                except websockets.exceptions.InvalidStatus as exc:
+
+                    last_error = exc
+
+                    await self.close()
+
+                    # Pour un 401, reconnecter sans fin ne sert à rien.
+                    # Le problème est généralement l'URL ou
+                    # l'authentification.
+                    status_code = getattr(
+                        exc,
+                        "status_code",
+                        None,
                     )
 
+                    if status_code == 401:
+                        raise RuntimeError(
+                            "Deriv WebSocket returned HTTP 401 "
+                            "(Unauthorized). "
+                            "Check DERIV_WS_URL in Render. "
+                            "For public market data, use: "
+                            "wss://ws.binaryws.com/websockets/v3 "
+                            "without app_id."
+                        ) from exc
+
+                    # Pour 429, on attend plus longtemps.
+                    if status_code == 429:
+
+                        delay = min(
+                            5 * (attempt + 1),
+                            20,
+                        )
+
+                    else:
+
+                        delay = min(
+                            2 ** attempt,
+                            10,
+                        )
+
+                    if attempt < retries - 1:
+                        await asyncio.sleep(delay)
+
+                # --------------------------------------------------------
+                # Erreur API Deriv
+                # --------------------------------------------------------
+
                 except RuntimeError:
-                    # Les erreurs API ne doivent pas provoquer
-                    # automatiquement une boucle infinie.
+
+                    # Les erreurs retournées directement par l'API
+                    # ne doivent pas provoquer une reconnexion inutile.
                     raise
 
+                # --------------------------------------------------------
+                # Autre erreur
+                # --------------------------------------------------------
+
                 except Exception as exc:
+
                     last_error = exc
+
                     await self.close()
 
                     if attempt < retries - 1:
-                        await asyncio.sleep(
-                            min(2 ** attempt, 5)
+
+                        delay = min(
+                            2 ** attempt,
+                            5,
                         )
 
+                        await asyncio.sleep(delay)
+
             raise RuntimeError(
-                f"Deriv request failed after {retries} attempts: "
-                f"{last_error}"
+                f"Deriv request failed after "
+                f"{retries} attempts: {last_error}"
             )
 
-    # ------------------------------------------------------------------
+    # ================================================================
     # ACTIVE SYMBOLS
-    # ------------------------------------------------------------------
+    # ================================================================
 
-    async def active_symbols(self) -> List[Dict[str, Any]]:
+    async def active_symbols(
+        self,
+    ) -> List[Dict[str, Any]]:
         """
-        Retourne les marchés actifs disponibles sur Deriv.
+        Retourne les symboles actifs disponibles.
+
+        Aucune authentification n'est nécessaire.
         """
 
         data = await self._request(
@@ -286,16 +514,19 @@ class DerivPublicClient:
             }
         )
 
-        symbols = data.get("active_symbols", [])
+        symbols = data.get(
+            "active_symbols",
+            [],
+        )
 
         if not isinstance(symbols, list):
             return []
 
         return symbols
 
-    # ------------------------------------------------------------------
+    # ================================================================
     # CANDLES
-    # ------------------------------------------------------------------
+    # ================================================================
 
     async def candles(
         self,
@@ -304,84 +535,164 @@ class DerivPublicClient:
         count: int = 500,
     ) -> List[Dict[str, Any]]:
         """
-        Récupère les bougies historiques d'un symbole.
+        Récupère les bougies historiques.
 
         Exemple :
 
-            candles("frxEURUSD", "1H", 500)
+            await client.candles(
+                "1HZ100V",
+                "1H",
+                500
+            )
 
-        devient automatiquement :
-
-            granularity = 3600
+        Le "1H" est automatiquement transformé en 3600.
         """
 
-        if not symbol:
-            raise ValueError("Symbol cannot be empty")
+        # ------------------------------------------------------------
+        # Symbol
+        # ------------------------------------------------------------
 
-        seconds = self.normalize_granularity(granularity)
+        if not symbol:
+            raise ValueError(
+                "Symbol cannot be empty"
+            )
+
+        symbol = str(symbol).strip()
+
+        # ------------------------------------------------------------
+        # Granularity
+        # ------------------------------------------------------------
+
+        seconds = self.normalize_granularity(
+            granularity
+        )
+
+        # ------------------------------------------------------------
+        # Count
+        # ------------------------------------------------------------
+
+        try:
+            count = int(count)
+
+        except (TypeError, ValueError) as exc:
+
+            raise ValueError(
+                f"Invalid candle count: {count}"
+            ) from exc
 
         if count <= 0:
             raise ValueError(
                 f"count must be positive: {count}"
             )
 
-        # Deriv impose des limites raisonnables sur count.
-        count = min(int(count), 5000)
+        # Limite de sécurité.
+        count = min(count, 5000)
+
+        # ------------------------------------------------------------
+        # Requête
+        # ------------------------------------------------------------
 
         request = {
-            "ticks_history": str(symbol),
+            "ticks_history": symbol,
             "end": "latest",
             "count": count,
             "granularity": seconds,
             "style": "candles",
         }
 
-        data = await self._request(request)
+        data = await self._request(
+            request
+        )
 
-        candles = data.get("candles", [])
+        # ------------------------------------------------------------
+        # Candles
+        # ------------------------------------------------------------
+
+        candles = data.get(
+            "candles",
+            [],
+        )
 
         if not isinstance(candles, list):
             return []
 
-        # Normalisation des valeurs numériques.
         result: List[Dict[str, Any]] = []
 
+        # ------------------------------------------------------------
+        # Normalisation
+        # ------------------------------------------------------------
+
         for candle in candles:
+
             try:
+
                 result.append(
                     {
-                        "epoch": int(candle["epoch"]),
-                        "open": float(candle["open"]),
-                        "high": float(candle["high"]),
-                        "low": float(candle["low"]),
-                        "close": float(candle["close"]),
+                        "epoch": int(
+                            candle["epoch"]
+                        ),
+                        "open": float(
+                            candle["open"]
+                        ),
+                        "high": float(
+                            candle["high"]
+                        ),
+                        "low": float(
+                            candle["low"]
+                        ),
+                        "close": float(
+                            candle["close"]
+                        ),
                     }
                 )
-            except (KeyError, TypeError, ValueError):
-                # Une bougie invalide ne doit pas faire tomber
-                # tout le scanner.
+
+            except (
+                KeyError,
+                TypeError,
+                ValueError,
+            ):
+
+                # Une bougie incorrecte ne doit pas faire
+                # planter tout le scanner.
                 continue
 
         return result
 
-    # ------------------------------------------------------------------
-    # HELPERS
-    # ------------------------------------------------------------------
+    # ================================================================
+    # PING
+    # ================================================================
 
     async def ping(self) -> bool:
         """
-        Teste la connexion Deriv.
+        Teste la connexion publique Deriv.
         """
 
         try:
-            data = await self._request({"ping": 1})
-            return data.get("msg_type") == "ping"
+
+            data = await self._request(
+                {"ping": 1}
+            )
+
+            return data.get(
+                "msg_type"
+            ) == "ping"
+
         except Exception:
+
             return False
+
+    # ================================================================
+    # CONTEXT MANAGER
+    # ================================================================
 
     async def __aenter__(self):
         await self.connect()
         return self
 
-    async def __aexit__(self, exc_type, exc, tb):
+    async def __aexit__(
+        self,
+        exc_type,
+        exc,
+        tb,
+    ):
         await self.close()
