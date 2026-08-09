@@ -31,6 +31,12 @@ class MultiTFScanner:
         n=min(14,len(candles)); return sum(c.high-c.low for c in candles[-n:])/n
     async def run_once(self):
         syms=await self.client.active_symbols()
+        if not syms:
+            try:
+                test_candles = await self.client.candles('R_100', 3600, 5)
+                log.info('Diagnostic: direct candles(R_100) returned %d bars',len(test_candles))
+            except Exception:
+                log.exception('Diagnostic: direct candles(R_100) call failed')
         selected=[s for s in syms if str(s.get('market','')).lower() in ALLOWED and not int(s.get('is_trading_suspended',0) or 0)]
         if not selected and syms:
             sample=sorted({str(s.get('market','')) for s in syms})[:10]
