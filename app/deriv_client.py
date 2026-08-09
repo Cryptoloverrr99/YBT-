@@ -18,6 +18,6 @@ class DerivPublicClient:
     async def active_symbols(self):
         d=await self._request({'active_symbols':'full'}); return d.get('active_symbols',[])
     async def candles(self,symbol,granularity,count):
-        d=await self._request{'ticks_history':symbol,'end':'latest','count':count,'granularity':granularity,'style':'candles'}
+        d=await self._request({'ticks_history':symbol,'end':'latest','count':count,'granularity':granularity,'style':'candles'})
         raw=d.get('candles',[])
         return [Candle(int(x.get('epoch',x.get('open_time'))),float(x['open']),float(x['high']),float(x['low']),float(x['close']),float(x.get('volume',0) or 0)) for x in raw]
