@@ -37,15 +37,16 @@ class DerivPublicClient:
                     if 'error' in d: raise RuntimeError(d['error'].get('message','Deriv API error'))
                     return d
     async def active_symbols(self):
-        # `product_type` et `landing_company` doivent être fournis
-        # explicitement :
+        # `product_type` et `landing_company_short` doivent être
+        # fournis explicitement :
         # - sans product_type, Deriv renvoie une liste vide
-        # - sans landing_company, Deriv déduit la région depuis l'IP
-        #   du serveur (ex: datacenter Render aux US) et peut aussi
-        #   renvoyer une liste vide pour cette région par défaut.
+        # - sans landing_company_short (nom EXACT du champ pour
+        #   l'API classique, pas "landing_company"), Deriv déduit la
+        #   région depuis l'IP du serveur et peut renvoyer une liste
+        #   vide pour cette région par défaut.
         # 'svg' (Deriv (SVG) LLC) couvre le plus large éventail de
         # symboles, y compris forex, indices et synthétiques.
-        d=await self._request({'active_symbols':'brief','landing_company':'svg'})
+        d=await self._request({'active_symbols':'brief','product_type':'basic','landing_company_short':'svg'})
         result=d.get('active_symbols',[])
         if not result:
             log.info('Deriv active_symbols raw response keys=%s echo=%s',list(d.keys()),d.get('echo_req'))
